@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 페이지 설정
 st.set_page_config(
-    page_title="주식 시장 대시보드",
+    page_title="MarketFlow",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -265,7 +265,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def fetch_single_stock(ticker, period="3mo"):
+def fetch_single_stock(ticker, period="3mo", is_index=False):
     """단일 주식 데이터를 가져오는 함수 (장 시작 전/후 모두 지원)"""
     try:
         stock = yf.Ticker(ticker)
@@ -313,33 +313,36 @@ def fetch_single_stock(ticker, period="3mo"):
             change = 0
             change_pct = 0
         
-        # 이동평균선 계산
+        # 이동평균선 계산 (지수는 제외)
         ma20 = None
         ma60 = None
         ma20_status = "N/A"
         ma60_status = "N/A"
         
-        if not hist.empty and len(hist) >= 60:
-            # 20일 이동평균
-            ma20 = hist['Close'].tail(20).mean()
-            # 60일 이동평균
-            ma60 = hist['Close'].tail(60).mean()
-            
-            # 현재가와 비교
-            if current_price > 0:
-                if ma20:
+        if not is_index:
+            if not hist.empty and len(hist) >= 60:
+                # 20일 이동평균
+                ma20 = hist['Close'].tail(20).mean()
+                # 60일 이동평균
+                ma60 = hist['Close'].tail(60).mean()
+                
+                # 현재가와 비교
+                if current_price > 0:
+                    if ma20:
+                        ma20_status = "상회" if current_price > ma20 else "하회"
+                    if ma60:
+                        ma60_status = "상회" if current_price > ma60 else "하회"
+            elif not hist.empty and len(hist) >= 20:
+                # 20일 이동평균만 계산
+                ma20 = hist['Close'].tail(20).mean()
+                if current_price > 0 and ma20:
                     ma20_status = "상회" if current_price > ma20 else "하회"
-                if ma60:
-                    ma60_status = "상회" if current_price > ma60 else "하회"
-        elif not hist.empty and len(hist) >= 20:
-            # 20일 이동평균만 계산
-            ma20 = hist['Close'].tail(20).mean()
-            if current_price > 0 and ma20:
-                ma20_status = "상회" if current_price > ma20 else "하회"
         
-        # 시가총액이 없으면 가격 기반으로 추정
+        # 시가총액이 없으면 가격 기반으로 추정 (지수는 제외)
         market_cap = info.get('marketCap', 0)
-        if market_cap <= 0 and current_price > 0:
+        if is_index:
+            market_cap = 0  # 지수는 시가총액이 없음
+        elif market_cap <= 0 and current_price > 0:
             # 발행주식수 * 현재가격으로 추정 시도
             shares_outstanding = info.get('sharesOutstanding', 0)
             if shares_outstanding > 0:
@@ -403,7 +406,6 @@ def get_stock_data_cached(tickers, period="3mo", max_workers=15):
 def get_stock_data_fresh(tickers, period="3mo", max_workers=15):
     """캐시를 무시하고 최신 데이터를 가져오는 함수"""
     return get_stock_data_parallel(tickers, period, max_workers, progress_callback=None)
-
 
 def create_sector_tables(data):
     """섹터별로 그룹화된 테이블 생성"""
@@ -647,15 +649,78 @@ def main():
         </div>
         """.format(market_status=market_status), unsafe_allow_html=True)
     
-    # 메트릭 표시
+    # 주요 지수 데이터 가져오기
+    index_tickers = {
+        'S&P 500': '^GSPC',
+        '나스닥': '^IXIC',
+        '다우존스': '^DJI',
+        '러셀 2000': '^RUT'
+    }
+    
+    index_data = {}
+    with st.spinner("주요 지수 데이터 로딩 중..."):
+        for index_name, ticker in index_tickers.items():
+            try:
+                ticker_result, info = fetch_single_stock(ticker, period="5d", is_index=True)
+                if info:
+                    index_data[index_name] = info
+            except:
+                pass
+    
+    # 메트릭 표시 - 고급 디자인
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                padding: 1rem; border-radius: 10px; color: white; 
-                font-size: 1.5rem; font-weight: 600; margin: 2rem 0 1rem 0; text-align: center;">
-        📈 주요 지표
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%); 
+                padding: 1.5rem; border-radius: 20px; color: white; 
+                font-size: 1.8rem; font-weight: 700; margin: 2rem 0 1.5rem 0; 
+                text-align: center; position: relative; overflow: hidden;
+                box-shadow: 0 8px 32px rgba(102, 126, 234, 0.3),
+                            0 4px 16px rgba(118, 75, 162, 0.2);">
+        <div style="position: absolute; top: -50%; right: -50%; width: 200%; height: 200%;
+                    background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+                    animation: rotate 10s linear infinite;"></div>
+        <span style="position: relative; z-index: 1;">📈 주요 지표</span>
     </div>
+    <style>
+        @keyframes rotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
     """, unsafe_allow_html=True)
     
+    # 주요 지수 표시
+    if index_data:
+        st.markdown("### 📊 주요 지수")
+        index_cols = st.columns(4)
+        index_names = ['S&P 500', '나스닥', '다우존스', '러셀 2000']
+        
+        for idx, index_name in enumerate(index_names):
+            if index_name in index_data:
+                info = index_data[index_name]
+                price = info.get('price', 0)
+                change_pct = info.get('change_pct', 0)
+                
+                with index_cols[idx]:
+                    # 가격 포맷팅 (지수는 소수점 없이 표시)
+                    if price > 0:
+                        if price > 10000:
+                            price_str = f"{price:,.0f}"
+                        else:
+                            price_str = f"{price:,.2f}"
+                    else:
+                        price_str = "N/A"
+                    
+                    st.metric(
+                        index_name,
+                        price_str,
+                        delta=f"{change_pct:+.2f}%",
+                        delta_color="normal" if change_pct >= 0 else "inverse"
+                    )
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+    
+    # 종목 통계
+    st.markdown("### 📊 종목 통계")
     col1, col2, col3, col4 = st.columns(4)
     
     total_stocks = len(data)

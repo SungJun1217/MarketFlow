@@ -1,11 +1,9 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+import re
 
 # 페이지 설정
 st.set_page_config(
@@ -265,47 +263,42 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def fetch_single_stock(ticker, period="3mo", is_index=False):
-    """단일 주식 데이터를 가져오는 함수 (장 시작 전/후 모두 지원)"""
+def fetch_single_stock(ticker, period="3mo", is_index=False, timeout=10):
+    """단일 주식 데이터를 가져오는 함수 (장 시작 전/후 모두 지원) - 최적화 버전"""
     try:
         stock = yf.Ticker(ticker)
-        # 60일 이동평균을 계산하기 위해 최소 3개월 데이터 필요
-        hist = stock.history(period=period)
-        info = stock.info
         
-        # info에서 기본 정보 가져오기
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
-        prev_close = info.get('previousClose')
+        # 병렬로 history와 info 가져오기 (더 빠름)
+        # 지수는 짧은 기간만 필요
+        hist_period = "5d" if is_index else period
         
-        # 히스토리 데이터가 있으면 사용
+        # 빠른 데이터 가져오기 - interval 최소화
+        hist = stock.history(period=hist_period, timeout=timeout)
+        
+        # info 가져오기 (최적화)
+        try:
+            info = stock.info
+        except:
+            # info 가져오기 실패 시 빈 dict 사용
+            info = {}
+        
+        # 히스토리에서 직접 가격 정보 추출 (더 빠름)
         if not hist.empty:
-            # 현재 가격이 없으면 최신 종가 사용
-            if current_price is None or current_price <= 0:
-                current_price = hist['Close'].iloc[-1]
-            
-            # 전일 종가가 없으면 히스토리에서 찾기
-            if prev_close is None or prev_close <= 0:
-                if len(hist) >= 2:
-                    # 최근 거래일의 종가 사용
-                    prev_close = hist['Close'].iloc[-2]
-                elif len(hist) == 1:
-                    # 데이터가 1일치만 있으면 현재 가격 사용 (장 시작 전)
-                    prev_close = current_price
-                else:
-                    prev_close = current_price
-            
+            current_price = hist['Close'].iloc[-1]
             volume = hist['Volume'].iloc[-1] if len(hist) > 0 else 0
-        else:
-            # 히스토리 데이터가 없으면 info만 사용
-            if current_price is None or current_price <= 0:
-                current_price = prev_close if prev_close else 0
             
-            if prev_close is None or prev_close <= 0:
+            # 전일 종가
+            if len(hist) >= 2:
+                prev_close = hist['Close'].iloc[-2]
+            else:
                 prev_close = current_price
-            
+        else:
+            # 히스토리가 없으면 info에서 가져오기
+            current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
+            prev_close = info.get('previousClose') or current_price
             volume = 0
         
-        # 변동률 계산 (장 시작 전에는 0%일 수 있음)
+        # 변동률 계산
         if prev_close and prev_close > 0:
             change = current_price - prev_close
             change_pct = (change / prev_close) * 100
@@ -313,54 +306,54 @@ def fetch_single_stock(ticker, period="3mo", is_index=False):
             change = 0
             change_pct = 0
         
-        # 이동평균선 계산 (지수는 제외)
+        # 이동평균선 계산 (지수는 제외, 최적화)
         ma20 = None
         ma60 = None
         ma20_status = "N/A"
         ma60_status = "N/A"
         
-        if not is_index:
-            if not hist.empty and len(hist) >= 60:
-                # 20일 이동평균
-                ma20 = hist['Close'].tail(20).mean()
-                # 60일 이동평균
-                ma60 = hist['Close'].tail(60).mean()
+        if not is_index and not hist.empty:
+            close_prices = hist['Close']
+            hist_len = len(close_prices)
+            
+            if hist_len >= 60:
+                # 벡터화된 계산으로 더 빠름
+                ma20 = close_prices.tail(20).mean()
+                ma60 = close_prices.tail(60).mean()
                 
-                # 현재가와 비교
                 if current_price > 0:
-                    if ma20:
-                        ma20_status = "상회" if current_price > ma20 else "하회"
-                    if ma60:
-                        ma60_status = "상회" if current_price > ma60 else "하회"
-            elif not hist.empty and len(hist) >= 20:
-                # 20일 이동평균만 계산
-                ma20 = hist['Close'].tail(20).mean()
-                if current_price > 0 and ma20:
+                    ma20_status = "상회" if current_price > ma20 else "하회"
+                    ma60_status = "상회" if current_price > ma60 else "하회"
+            elif hist_len >= 20:
+                ma20 = close_prices.tail(20).mean()
+                if current_price > 0:
                     ma20_status = "상회" if current_price > ma20 else "하회"
         
-        # 시가총액이 없으면 가격 기반으로 추정 (지수는 제외)
-        market_cap = info.get('marketCap', 0)
-        if is_index:
-            market_cap = 0  # 지수는 시가총액이 없음
-        elif market_cap <= 0 and current_price > 0:
-            # 발행주식수 * 현재가격으로 추정 시도
-            shares_outstanding = info.get('sharesOutstanding', 0)
-            if shares_outstanding > 0:
-                market_cap = shares_outstanding * current_price
-            else:
-                # 발행주식수도 없으면 기본 추정값 사용
-                market_cap = current_price * 100000000  # 가격 * 1억
+        # 시가총액 계산 (지수는 제외)
+        market_cap = 0
+        if not is_index:
+            market_cap = info.get('marketCap', 0)
+            if market_cap <= 0 and current_price > 0:
+                shares_outstanding = info.get('sharesOutstanding', 0)
+                if shares_outstanding > 0:
+                    market_cap = shares_outstanding * current_price
+        
+        # info에서 안전하게 값 가져오기
+        def safe_get(key, default='Unknown'):
+            if isinstance(info, dict):
+                return info.get(key, default)
+            return getattr(info, key, default) if hasattr(info, key) else default
         
         return ticker, {
-            'name': info.get('longName', ticker),
+            'name': safe_get('longName', ticker),
             'price': current_price,
             'prev_close': prev_close,
             'change': change,
             'change_pct': change_pct,
             'volume': volume,
             'market_cap': market_cap,
-            'sector': info.get('sector', 'Unknown'),
-            'industry': info.get('industry', 'Unknown'),
+            'sector': safe_get('sector', 'Unknown'),
+            'industry': safe_get('industry', 'Unknown'),
             'ma20': ma20,
             'ma60': ma60,
             'ma20_status': ma20_status,
@@ -369,27 +362,35 @@ def fetch_single_stock(ticker, period="3mo", is_index=False):
     except Exception as e:
         # 오류 발생 시 None 반환
         return ticker, None
-    
-    return ticker, None
 
-def get_stock_data_parallel(tickers, period="1d", max_workers=15, progress_callback=None):
-    """주식 데이터를 병렬로 가져오는 함수 (진행 상황 추적 가능)"""
+def get_stock_data_parallel(tickers, period="1d", max_workers=15, progress_callback=None, timeout=15):
+    """주식 데이터를 병렬로 가져오는 함수 (진행 상황 추적 가능) - 최적화 버전"""
     data = {}
     total = len(tickers)
     completed = 0
     
+    # 동적 워커 수 조정 (너무 많으면 오히려 느려질 수 있음)
+    optimal_workers = min(max_workers, len(tickers), 32)
+    
     # ThreadPoolExecutor를 사용하여 병렬 처리
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
         # 모든 티커에 대해 작업 제출
-        future_to_ticker = {executor.submit(fetch_single_stock, ticker, period): ticker 
-                           for ticker in tickers}
+        future_to_ticker = {
+            executor.submit(fetch_single_stock, ticker, period, False, timeout): ticker 
+            for ticker in tickers
+        }
         
-        # 완료된 작업부터 처리
-        for future in as_completed(future_to_ticker):
-            ticker, result = future.result()
-            completed += 1
-            if result is not None:
-                data[ticker] = result
+        # 완료된 작업부터 처리 (타임아웃 처리)
+        for future in as_completed(future_to_ticker, timeout=timeout * len(tickers)):
+            try:
+                ticker, result = future.result(timeout=timeout)
+                completed += 1
+                if result is not None:
+                    data[ticker] = result
+            except (FutureTimeoutError, Exception) as e:
+                completed += 1
+                # 타임아웃이나 오류 발생 시 해당 티커 스킵
+                pass
             
             # 진행 상황 콜백 호출
             if progress_callback:
@@ -400,12 +401,37 @@ def get_stock_data_parallel(tickers, period="1d", max_workers=15, progress_callb
 # 캐시 설정 (진행 상황 없이 빠른 재사용)
 @st.cache_data(ttl=10)  # 10초마다 캐시 갱신 (실시간 업데이트)
 def get_stock_data_cached(tickers, period="3mo", max_workers=15):
-    """주식 데이터를 병렬로 가져오는 함수 (캐시용)"""
-    return get_stock_data_parallel(tickers, period, max_workers, progress_callback=None)
+    """주식 데이터를 병렬로 가져오는 함수 (캐시용) - 최적화"""
+    # 티커 리스트를 정렬하여 캐시 효율성 향상
+    sorted_tickers = tuple(sorted(tickers))
+    return get_stock_data_parallel(sorted_tickers, period, max_workers, progress_callback=None, timeout=12)
 
-def get_stock_data_fresh(tickers, period="3mo", max_workers=15):
-    """캐시를 무시하고 최신 데이터를 가져오는 함수"""
-    return get_stock_data_parallel(tickers, period, max_workers, progress_callback=None)
+@st.cache_data(ttl=10)
+def get_index_data_cached(index_tickers_dict, max_workers=4):
+    """주요 지수 데이터를 병렬로 가져오는 함수 (캐시용)"""
+    index_data = {}
+    index_list = list(index_tickers_dict.items())
+    
+    if not index_list:
+        return index_data
+    
+    # 병렬로 지수 데이터 가져오기
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(index_list))) as executor:
+        future_to_name = {
+            executor.submit(fetch_single_stock, ticker, "5d", True, timeout=8): name
+            for name, ticker in index_list
+        }
+        
+        for future in as_completed(future_to_name, timeout=30):
+            try:
+                name = future_to_name[future]
+                ticker, info = future.result(timeout=8)
+                if info:
+                    index_data[name] = info
+            except (FutureTimeoutError, Exception):
+                pass
+    
+    return index_data
 
 def create_sector_tables(data):
     """섹터별로 그룹화된 테이블 생성"""
@@ -617,9 +643,26 @@ def main():
     if 'last_refresh' not in st.session_state:
         st.session_state.last_refresh = datetime.now()
     
-    # 캐시를 사용하되, TTL이 짧아서 자동으로 갱신됨
-    with st.spinner("주식 데이터를 가져오는 중..."):
-        data = get_stock_data_cached(tickers, max_workers=32)
+    # 주요 지수 티커 정의
+    index_tickers = {
+        'S&P 500': '^GSPC',
+        '나스닥': '^IXIC',
+        '다우존스': '^DJI',
+        '러셀 2000': '^RUT'
+    }
+    
+    # 주식 데이터와 지수 데이터를 병렬로 가져오기 (더 빠름)
+    with st.spinner("주식 및 지수 데이터를 가져오는 중..."):
+        # 병렬로 두 작업 실행
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # 이동평균 계산을 위해 최소 3개월 데이터 필요하지만, 더 빠른 로딩을 위해 2개월로 조정 가능
+            # 60일 이동평균을 위해 최소 3개월 필요
+            stock_future = executor.submit(get_stock_data_cached, tickers, "3mo", 32)
+            index_future = executor.submit(get_index_data_cached, index_tickers, 4)
+            
+            # 결과 가져오기
+            data = stock_future.result()
+            index_data = index_future.result()
     
     if not data:
         st.error("데이터를 가져올 수 없습니다. 종목 코드를 확인해주세요.")
@@ -648,24 +691,6 @@ def main():
             {market_status} | 실시간 데이터 업데이트 중
         </div>
         """.format(market_status=market_status), unsafe_allow_html=True)
-    
-    # 주요 지수 데이터 가져오기
-    index_tickers = {
-        'S&P 500': '^GSPC',
-        '나스닥': '^IXIC',
-        '다우존스': '^DJI',
-        '러셀 2000': '^RUT'
-    }
-    
-    index_data = {}
-    with st.spinner("주요 지수 데이터 로딩 중..."):
-        for index_name, ticker in index_tickers.items():
-            try:
-                ticker_result, info = fetch_single_stock(ticker, period="5d", is_index=True)
-                if info:
-                    index_data[index_name] = info
-            except:
-                pass
     
     # 메트릭 표시 - 고급 디자인
     st.markdown("""
@@ -817,7 +842,6 @@ def main():
             html_table = styled_table.to_html(escape=False, index=False, table_id=table_id)
             
             # pandas가 생성한 스타일 태그를 추출하고 정리
-            import re
             style_match = re.search(r'<style type="text/css">(.*?)</style>', html_table, re.DOTALL)
             pandas_styles = ""
             if style_match:
